@@ -1,0 +1,356 @@
+### IMPORTS
+%pip install moabb
+from moabb.datasets import BNCI2014_001
+from moabb.paradigms import MotorImagery
+from mne.decoding import CSP
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
+from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis as QDA
+from sklearn.pipeline import Pipeline
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+
+### PHASE ONE fragment
+
+dataset = BNCI2014_001()
+paradigm = MotorImagery(
+    events=["left_hand","right_hand"],
+    n_classes=2,           # Binary simplification (Left vs. Right)
+    fmin=8.0, fmax=32.0,   # Bandpass filter (Alpha/Beta bands)
+    tmin=0.5, tmax=2.5     # Epoching (0.5s to 2.5s post-cue)
+)
+
+dataset.subject_list = [1]
+
+# X = The EEG signals (Trials x Channels x Time)
+# y = The labels ('left_hand' or 'right_hand')
+X, y, metadata = paradigm.get_data(dataset=dataset, subjects=[1])
+
+# Step 0.1: Separate training and testing data
+train_mask = metadata['session'] == '0train'
+test_mask  = metadata['session'] == '1test'
+left_mask  = y == 'left_hand'
+right_mask = y == 'right_hand'
+
+X_train_left  = X[train_mask & left_mask]
+y_train_left  = y[train_mask & left_mask]
+
+X_train_right = X[train_mask & right_mask]
+y_train_right = y[train_mask & right_mask]
+
+X_train_all = np.concatenate([X_train_left, X_train_right], axis=0)
+y_train_all = np.concatenate([y_train_left, y_train_right], axis=0)
+X_train_partial = np.concatenate([X_train_left[:10], X_train_right[:10]], axis=0)
+y_train_partial = np.concatenate([y_train_left[:10], y_train_right[:10]], axis=0)
+
+X_test = X[test_mask]
+y_test = y[test_mask]
+
+### PHASE TWO
+
+# Slicing the data:
+# write the function
+def slice_trial(trial_data, window_size, step_size):
+    #initialize empty list
+    chunks = []
+
+    #initial start_index and end_index, created outside loop and updated inside it
+    start_index = 0
+    end_index = start_index + window_size
+
+    #define data size
+    total_length = trial_data.shape[1]  # number of timepoints
+
+    #create the loop
+    while end_index <= total_length:
+
+        #slice the data
+        chunk = trial_data[:, start_index:end_index]
+        chunks.append(chunk)
+
+        #update the indexes
+        start_index += step_size
+        end_index = start_index + window_size
+    #return the new data
+    return np.array(chunks)
+
+# Majority vote
+def majority_vote(predictions):
+    values, counts = np.unique(predictions, return_counts=True)
+    return values[np.argmax(counts)]
+
+### PHASE THREE
+def slice_trials(X_train, y_train, window_size, step_size):
+    #Step 1: Create new empty lists
+    new_X = []
+    new_y = []
+
+    #Step 2: Loop through the training data and slice each one and tag each window with that trial's original label
+    for trial, label in zip(X_train, y_train):
+        trial_chunks = slice_trial(trial, window_size, step_size)  # (n_chunks, channels, window_size)
+        new_X.append(trial_chunks)
+        new_y.extend([label] * trial_chunks.shape[0])  # repeat the label once per chunk
+
+    #flatten the per-trial chunk arrays into one big matrix
+    X_train_sliced = np.vstack(new_X)
+
+    #convert to a numpy array
+    y_train_sliced = np.array(new_y)
+
+    return X_train_sliced, y_train_sliced
+
+### another PHASE ONE fragment
+
+# Step 2: Prepare storage
+lda_accuracies = []
+qda_accuracies = []
+
+windows = np.arange(0.9, 0.1, -0.05)          # [0.9, 0.85, 0.8..., 0.6]
+steps   = np.arange(0.03, 0.6, 0.03)          # [0.03, 0.06, ..., 0.57]
+slice_parameters = [(w, s) for w in windows for s in steps if s < w and s + w < 1]
+
+#Step 3: Start a loop
+for window,step in slice_parameters:
+    # Step 4: Slice the data
+    X_train_sliced, y_train_sliced = slice_trials(X_train_partial, y_train_partial, round(window*X_train_all.shape[2]), round(step*X_train_all.shape[2]))
+
+    # Step 5: Constructing the LDA pipeline
+    lda_pipeline = Pipeline([
+        ('csp', CSP(n_components=4, reg=None, log=True)),
+        ('lda', LDA())
+    ])
+
+    # Step 6: Constructing the QDA pipeline
+    qda_pipeline = Pipeline([
+        ('csp', CSP(n_components=4, reg=None, log=True)),
+        ('qda', QDA(reg_param=0.1))
+    ])
+
+    lda_pipeline.fit(X_train_sliced, y_train_sliced)   # CSP learns filters, LDA learns boundaries
+    qda_pipeline.fit(X_train_sliced, y_train_sliced)
+
+    lda_iter_acc = []
+    for Xtrial, Ytrial in zip(X_test, y_test):
+        newX, _ = slice_trials([Xtrial], [Ytrial], round(window*X_train_all.shape[2]), round(step*X_train_all.shape[2]))
+        lda_predict = lda_pipeline.predict(newX)  # predict on test, compare to Ytrial
+        lda_predict = majority_vote(lda_predict)
+        lda_acc = int(lda_predict == Ytrial)
+        lda_iter_acc.append(lda_acc)
+    lda_accuracies.append(sum(lda_iter_acc)/len(lda_iter_acc))
+
+    qda_iter_acc = []
+    for Xtrial, Ytrial in zip(X_test, y_test):
+        newX, _ = slice_trials([Xtrial], [Ytrial], round(window*X_train_all.shape[2]), round(step*X_train_all.shape[2]))
+        qda_predict = qda_pipeline.predict(newX)  # predict on test, compare to Ytrial
+        qda_predict = majority_vote(qda_predict)
+        qda_acc = int(qda_predict == Ytrial)
+        qda_iter_acc.append(qda_acc)
+    qda_accuracies.append((sum(qda_iter_acc)/len(qda_iter_acc)))
+
+#testing alternate display method
+
+results_df = pd.DataFrame({
+    'Window': [round(p[0], 2) for p in slice_parameters],
+    'Step': [round(p[1], 2) for p in slice_parameters],
+    'LDA': lda_accuracies,
+    'QDA': qda_accuracies
+})
+
+lda_top_2_accuracies = results_df['LDA'].sort_values(ascending=False).unique()[:2]
+qda_top_2_accuracies = results_df['QDA'].sort_values(ascending=False).unique()[:2]
+
+# Get all rows that match the top 2 accuracy values
+lda_top_results_df = results_df[results_df['LDA'].isin(lda_top_2_accuracies)].sort_values(by='LDA', ascending=False)
+qda_top_results_df = results_df[results_df['QDA'].isin(qda_top_2_accuracies)].sort_values(by='QDA', ascending=False)
+
+# Combine unique (Window, Step) pairs from both LDA and QDA top results
+combined_top_parameters = pd.concat([
+    lda_top_results_df[['Window', 'Step']],
+    qda_top_results_df[['Window', 'Step']]
+]).drop_duplicates().values.tolist()
+
+dataset = BNCI2014_001()
+paradigm = MotorImagery(
+    events=["left_hand","right_hand"],
+    n_classes=2,           # Binary simplification (Left vs. Right)
+    fmin=8.0, fmax=32.0,   # Bandpass filter (Alpha/Beta bands)
+    tmin=0.5, tmax=2.5     # Epoching (0.5s to 2.5s post-cue)
+)
+
+N = list(range(5, X_train_all.shape[0]//2 - 15, 5))
+
+lda_all_mean_accuracies = []
+lda_all_std_accuracies = []
+qda_all_mean_accuracies = []
+qda_all_std_accuracies = []
+
+lda_all_no_aug_accuracies = []
+qda_all_no_aug_accuracies = []
+
+# X = The EEG signals (Trials x Channels x Time)
+# y = The labels ('left_hand' or 'right_hand')
+for i in N:
+
+  # Initialize new lists to store accuracies for these specific top parameters
+  lda_all_subjects_accuracies_top = []
+  qda_all_subjects_accuracies_top = []
+  lda_all_subjects_acc_no_aug = []
+  qda_all_subjects_acc_no_aug = []
+
+  for subject_id in dataset.subject_list:
+    X, y, metadata = paradigm.get_data(dataset=dataset, subjects=[subject_id])
+
+    # Step 0.1: Separate training and testing data
+    train_mask = metadata['session'] == '0train'
+    test_mask  = metadata['session'] == '1test'
+    left_mask  = y == 'left_hand'
+    right_mask = y == 'right_hand'
+
+    X_train_left  = X[train_mask & left_mask]
+    y_train_left  = y[train_mask & left_mask]
+
+    X_train_right = X[train_mask & right_mask]
+    y_train_right = y[train_mask & right_mask]
+
+    X_test = X[test_mask]
+    y_test = y[test_mask]
+
+    qda_accuracies_top_for_subject = []
+    lda_accuracies_top_for_subject = []
+
+    for window, step in combined_top_parameters:
+        # Step 4: Slice the data
+        # Ensure window and step are floats for calculations
+        X_train_sliced_left, y_train_sliced_left = slice_trials(X_train_left[:i], y_train_left[:i], round(float(window)*X_train_left.shape[2]), round(float(step)*X_train_left.shape[2]))
+        X_train_sliced_right, y_train_sliced_right = slice_trials(X_train_right[:i], y_train_right[:i], round(float(window)*X_train_right.shape[2]), round(float(step)*X_train_right.shape[2]))
+
+        X_train_all_sliced = np.concatenate([X_train_sliced_left, X_train_sliced_right], axis=0)
+        y_train_all_sliced = np.concatenate([y_train_sliced_left, y_train_sliced_right], axis=0)
+
+        # Step 5: Constructing the LDA pipeline
+        lda_pipeline = Pipeline([
+            ('csp', CSP(n_components=4, reg=None, log=True)),
+            ('lda', LDA())
+        ])
+
+        # Step 6: Constructing the QDA pipeline
+        qda_pipeline = Pipeline([
+            ('csp', CSP(n_components=4, reg=None, log=True)),
+            ('qda', QDA(reg_param=0.1))
+        ])
+
+        lda_pipeline.fit(X_train_all_sliced, y_train_all_sliced)   # CSP learns filters, LDA learns boundaries
+        qda_pipeline.fit(X_train_all_sliced, y_train_all_sliced)
+
+        lda_iter_acc = []
+        for Xtrial, Ytrial in zip(X_test, y_test):
+            newX, _ = slice_trials([Xtrial], [Ytrial], round(float(window)*X_train_all.shape[2]), round(float(step)*X_train_all.shape[2]))
+            lda_predict = lda_pipeline.predict(newX)  # predict on test, compare to Ytrial
+            lda_predict = majority_vote(lda_predict)
+            lda_acc = int(lda_predict == Ytrial)
+            lda_iter_acc.append(lda_acc)
+        lda_accuracies_top_for_subject.append(sum(lda_iter_acc)/len(lda_iter_acc))
+
+        qda_iter_acc = []
+        for Xtrial, Ytrial in zip(X_test, y_test):
+            newX, _ = slice_trials([Xtrial], [Ytrial], round(float(window)*X_train_all.shape[2]), round(float(step)*X_train_all.shape[2]))
+            qda_predict = qda_pipeline.predict(newX)  # predict on test, compare to Ytrial
+            qda_predict = majority_vote(qda_predict)
+            qda_acc = int(qda_predict == Ytrial)
+            qda_iter_acc.append(qda_acc)
+        qda_accuracies_top_for_subject.append((sum(qda_iter_acc)/len(qda_iter_acc)))
+    lda_all_subjects_accuracies_top.append(lda_accuracies_top_for_subject)
+    qda_all_subjects_accuracies_top.append(qda_accuracies_top_for_subject)
+
+    # reconstruct pipelines for no aug
+    lda_pipeline = Pipeline([
+        ('csp', CSP(n_components=4, reg=None, log=True)),
+        ('lda', LDA())
+    ])
+
+    qda_pipeline = Pipeline([
+        ('csp', CSP(n_components=4, reg=None, log=True)),
+        ('qda', QDA(reg_param=0.1))
+    ])
+
+    #define new unsliced for no aug test
+    partial_left_train_x = X_train_left[:i]
+    partial_right_train_x = X_train_right[:i]
+    partial_left_train_y = y_train_left[:i]
+    partial_right_train_y = y_train_right[:i]
+
+    X_train_partial = np.concatenate([partial_left_train_x, partial_right_train_x], axis=0)
+    y_train_partial = np.concatenate([partial_left_train_y, partial_right_train_y], axis=0)
+
+    # test no aug
+    lda_pipeline.fit(X_train_partial, y_train_partial)   # CSP learns filters, LDA learns boundaries
+    qda_pipeline.fit(X_train_partial, y_train_partial)
+
+    lda_iter_acc = []
+    for Xtrial, Ytrial in zip(X_test, y_test):
+        lda_predict = lda_pipeline.predict(Xtrial[np.newaxis])[0]  # predict on test, compare to Ytrial
+        lda_acc = int(lda_predict == Ytrial)
+        lda_iter_acc.append(lda_acc)
+    lda_all_subjects_acc_no_aug.append(sum(lda_iter_acc)/len(lda_iter_acc))
+
+    qda_iter_acc = []
+    for Xtrial, Ytrial in zip(X_test, y_test):
+        qda_predict = qda_pipeline.predict(Xtrial[np.newaxis])[0]  # predict on test, compare to Ytrial
+        qda_acc = int(qda_predict == Ytrial)
+        qda_iter_acc.append(qda_acc)
+    qda_all_subjects_acc_no_aug.append((sum(qda_iter_acc)/len(qda_iter_acc)))
+
+  # Transpose the list of lists to get accuracies per parameter across subjects
+  lda_accuracies_per_parameter = np.array(lda_all_subjects_accuracies_top).T.tolist()
+  qda_accuracies_per_parameter = np.array(qda_all_subjects_accuracies_top).T.tolist()
+
+  # Calculate mean and standard deviation across subjects for each parameter combination
+  lda_mean_accuracies = [np.mean(accs) for accs in lda_accuracies_per_parameter]
+  lda_std_accuracies = [np.std(accs) for accs in lda_accuracies_per_parameter]
+  qda_mean_accuracies = [np.mean(accs) for accs in qda_accuracies_per_parameter]
+  qda_std_accuracies = [np.std(accs) for accs in qda_accuracies_per_parameter]
+
+
+  lda_all_mean_accuracies.append(lda_mean_accuracies)
+  lda_all_std_accuracies.append(lda_std_accuracies)
+  qda_all_mean_accuracies.append(qda_mean_accuracies)
+  qda_all_std_accuracies.append(qda_std_accuracies)
+
+  lda_all_no_aug_accuracies.append(lda_all_subjects_acc_no_aug)
+  qda_all_no_aug_accuracies.append(qda_all_subjects_acc_no_aug)
+
+lda_best_aug_mean = [max(accs) for accs in lda_all_mean_accuracies]
+lda_best_aug_std  = [lda_all_std_accuracies[i][np.argmax(lda_all_mean_accuracies[i])] for i in range(len(N))]
+
+qda_best_aug_mean = [max(accs) for accs in qda_all_mean_accuracies]
+qda_best_aug_std  = [qda_all_std_accuracies[i][np.argmax(qda_all_mean_accuracies[i])] for i in range(len(N))]
+
+lda_no_aug_mean = [np.mean(accs) for accs in lda_all_no_aug_accuracies]
+lda_no_aug_std  = [np.std(accs)  for accs in lda_all_no_aug_accuracies]
+
+qda_no_aug_mean = [np.mean(accs) for accs in qda_all_no_aug_accuracies]
+qda_no_aug_std  = [np.std(accs)  for accs in qda_all_no_aug_accuracies]
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharey=True)
+x = np.arange(len(N))
+w = 0.35
+
+for ax, (no_m, no_s, aug_m, aug_s, title) in zip(axes, [
+    (lda_no_aug_mean, lda_no_aug_std, lda_best_aug_mean, lda_best_aug_std, 'LDA'),
+    (qda_no_aug_mean, qda_no_aug_std, qda_best_aug_mean, qda_best_aug_std, 'QDA'),
+]):
+    ax.bar(x - w/2, no_m,  w, yerr=no_s,  capsize=4, label='No Augmentation',   color='steelblue',  alpha=0.85)
+    ax.bar(x + w/2, aug_m, w, yerr=aug_s, capsize=4, label='Best Augmentation', color='darkorange', alpha=0.85)
+    ax.axhline(0.5, color='red', ls='--', lw=1, alpha=0.5, label='Chance (50%)')
+    ax.set_xlabel('Training Samples per Class (N)')
+    ax.set_ylabel('Mean Accuracy')
+    ax.set_title(f'{title}: No Aug vs Best Aug')
+    ax.set_xticks(x)
+    ax.set_xticklabels(N, rotation=45, ha='right')
+    ax.set_ylim(0, 1)
+    ax.legend()
+
+plt.suptitle('Effect of Data Augmentation on Classification Accuracy', fontsize=14)
+plt.tight_layout()
+plt.show()
