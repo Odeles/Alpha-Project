@@ -1,0 +1,152 @@
+### IMPORTS
+from moabb.datasets import BNCI2014_001
+from moabb.paradigms import MotorImagery
+from mne.decoding import CSP
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
+from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis as QDA
+from sklearn.pipeline import Pipeline
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.stats import mode
+
+### PHASE ONE fragment
+
+dataset = BNCI2014_001()
+paradigm = MotorImagery(
+    events=["left_hand","right_hand"],
+    n_classes=2,           # Binary simplification (Left vs. Right)
+    fmin=8.0, fmax=32.0,   # Bandpass filter (Alpha/Beta bands)
+    tmin=0.5, tmax=2.5     # Epoching (0.5s to 2.5s post-cue)
+)
+
+dataset.subject_list = [1]
+
+# X = The EEG signals (Trials x Channels x Time)
+# y = The labels ('left_hand' or 'right_hand')
+X, y, metadata = paradigm.get_data(dataset=dataset, subjects=[1])
+
+# Step 0.1: Separate training and testing data
+train_mask = metadata['session'] == '0train'
+test_mask  = metadata['session'] == '1test'
+
+X_train_all = X[train_mask]
+y_train_all = y[train_mask]
+
+X_test = X[test_mask]
+y_test = y[test_mask]
+
+### PHASE TWO
+
+# Slicing the data:
+# write the function
+def slice_trial(trial_data, window_size, step_size):
+    #initialize empty list
+    chunks = []
+
+    #initial start_index and end_index, created outside loop and updated inside it
+    start_index = 0
+    end_index = start_index + window_size
+
+    #define data size
+    total_length = trial_data.shape[1]  # number of timepoints
+
+    #create the loop
+    while end_index <= total_length:
+
+        #slice the data
+        chunk = trial_data[:, start_index:end_index]
+        chunks.append(chunk)
+
+        #update the indexes
+        start_index += step_size
+        end_index = start_index + window_size
+    #return the new data
+    return np.array(chunks)
+
+# Majority vote
+def majority_vote(predictions):
+    values, counts = np.unique(predictions, return_counts=True)
+    return values[np.argmax(counts)]
+
+### PHASE THREE
+def expand_training_data(X_train, y_train, window_size, step_size):
+    #Step 1: Create new empty lists
+    new_X = []
+    new_y = []
+
+    #Step 2: Loop through the training data and slice each one and tag each window with that trial's original label
+    for trial, label in zip(X_train, y_train):
+        trial_chunks = slice_trial(trial, window_size, step_size)  # (n_chunks, channels, window_size)
+        new_X.append(trial_chunks)
+        new_y.extend([label] * trial_chunks.shape[0])  # repeat the label once per chunk
+
+    #flatten the per-trial chunk arrays into one big matrix
+    X_train_sliced = np.vstack(new_X)
+
+    #convert to a numpy array
+    y_train_sliced = np.array(new_y)
+
+    return X_train_sliced, y_train_sliced
+
+### another PHASE ONE fragment
+
+# Step 2: Prepare storage
+lda_accuracies = []
+qda_accuracies = []
+final_predictions = []
+
+slice_parameters = [(375,62),(250,125),(125,100)]
+
+#Step 3: Start a loop
+for window,step in slice_parameters:
+    # Step 4: Slice the data
+    X_train_sliced, y_train_sliced = expand_training_data(X_train_all[:20], y_train_all[:20], window, step)
+
+    # Step 5: Constructing the LDA pipeline
+    lda_pipeline = Pipeline([
+        ('csp', CSP(n_components=4, reg=None, log=True)),
+        ('lda', LDA())
+    ])
+
+    # Step 6: Constructing the QDA pipeline
+    qda_pipeline = Pipeline([
+        ('csp', CSP(n_components=4, reg=None, log=True)),
+        ('qda', QDA(reg_param=0.1))
+    ])
+
+    lda_pipeline.fit(X_train_sliced, y_train_sliced)   # CSP learns filters, LDA learns boundaries
+    qda_pipeline.fit(X_train_sliced, y_train_sliced)
+
+    lda_iter_acc = []
+    for Xtrial, Ytrial in zip(X_test, y_test):
+        newX, newY = expand_training_data([Xtrial], [Ytrial], window, step)
+        lda_predict = lda_pipeline.predict(newX)  # predict on test, compare to Ytrial
+        lda_predict = majority_vote(lda_predict)
+        lda_acc = int(lda_predict == Ytrial)
+        lda_iter_acc.append(lda_acc)
+    lda_accuracies.append(sum(lda_iter_acc)/len(lda_iter_acc))
+
+    qda_iter_acc = []
+    for Xtrial, Ytrial in zip(X_test, y_test):
+        newX, newY = expand_training_data([Xtrial], [Ytrial], window, step)
+        qda_predict = qda_pipeline.predict(newX)  # predict on test, compare to Ytrial
+        qda_predict = majority_vote(qda_predict)
+        qda_acc = int(qda_predict == Ytrial)
+        qda_iter_acc.append(qda_acc)
+    qda_accuracies.append((sum(qda_iter_acc)/len(qda_iter_acc)))
+
+x_labels = [f'Win: {w}, Step: {s}' for w, s in slice_parameters]
+
+plt.figure(figsize=(10, 6))
+
+plt.plot(x_labels, lda_accuracies, color='blue', marker='o', label='LDA')
+plt.plot(x_labels, qda_accuracies, color='red',  marker='o', label='QDA')
+
+plt.axhline(y=0.5, color='gray', linestyle='--', label='Chance level (50%)') #Any result below this line means the model is actively doing worse than random, which is a red flag.
+
+plt.xlabel('Slicer Parameters (Window Size, Step Size))')
+plt.ylabel('Test Accuracy')
+plt.title('LDA vs QDA: Effect Slicing Strategy')
+plt.legend()
+plt.grid(True)
+plt.show()
